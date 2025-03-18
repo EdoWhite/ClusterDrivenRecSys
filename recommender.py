@@ -16,7 +16,9 @@ import json
 import re
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
+# ---------------------------
+# LLM to Simulate Users
+# ---------------------------
 class LLMValidator:
     def __init__(self, api_key=None):
         self.api_key = api_key
@@ -126,6 +128,9 @@ class LLMValidator:
         except:
             return 0.0
 
+# ---------------------------
+# Collaborative Filtering
+# ---------------------------
 class CFBaseline:
     def __init__(self, factors=128, iterations=15, regularization=0.01):
         self.factors = factors
@@ -196,8 +201,6 @@ class DataLoader:
         # Enhanced text representation
         movies["text"] = movies["title"] + " " + movies["genres"].str.replace('|', ' ') 
         print(f"Loaded {len(movies)} movies and {len(ratings)} ratings.")
-        #print(f"Movies: {movies}")
-        #print(f"Ratings: {ratings}")
         # Return movies, ratings, and the size of the dataset
         return movies, ratings, len(movies), len(ratings)
 
@@ -207,115 +210,159 @@ class DataLoader:
 class OnlineClustering:
     def __init__(self, initial_threshold=0.6, adjust_interval=150, dynamic=True, verbose=False):
         self.threshold = initial_threshold
-        self.centroids = []
-        self.cluster_items = defaultdict(list)
-        self.item_embeddings = {}
+        self.centroids = []  # List of cluster centroids
+        self.cluster_items = defaultdict(list)  # Map cluster_id -> list of item indices
+        self.item_embeddings = {}  # Map item_idx -> embedding
+        self.item_to_cluster = {}  # Map item_idx -> cluster_id
+        self.cluster_centroids = {}  # Map cluster_id -> centroid
         self.counter = 0
         self.adjust_interval = adjust_interval
         self.dynamic = dynamic
         self.verbose = verbose
-        
+        self.next_cluster_id = 0
+
     def add_item(self, embedding, item_idx):
+        # Store the item embedding
         self.item_embeddings[item_idx] = embedding
         self.counter += 1
 
-        # Original clustering logic
+        # Handle first item case
         if not self.centroids:
-            self.centroids.append(embedding)
-            self.cluster_items[0].append(item_idx)
-            assigned_cluster = 0
+            cluster_id = self._create_new_cluster(embedding, item_idx)
+            return cluster_id
+
+        # Find most similar cluster
+        similarities = cosine_similarity([embedding], self.centroids)[0]
+        max_sim_idx = np.argmax(similarities)
+        max_sim = similarities[max_sim_idx]
+
+        # Get actual cluster ID
+        cluster_id = list(self.cluster_centroids.keys())[max_sim_idx]
+
+        if max_sim > self.threshold:
+            # Add to existing cluster
+            self.cluster_items[cluster_id].append(item_idx)
+            self.item_to_cluster[item_idx] = cluster_id
+            # Update centroid as mean of all items in cluster
+            cluster_embeddings = [self.item_embeddings[idx] for idx in self.cluster_items[cluster_id]]
+            new_centroid = np.mean(cluster_embeddings, axis=0)
+            # Normalize centroid
+            new_centroid = new_centroid / np.linalg.norm(new_centroid)
+            self.cluster_centroids[cluster_id] = new_centroid
+            # Update centroids list
+            self._update_centroids_list()
         else:
-            centroid_matrix = np.array(self.centroids)
-            similarities = cosine_similarity([embedding], centroid_matrix)[0]
-            similarities = similarities * (1 + np.random.uniform(-0.05, 0.05)) # Add noise to escape minimas
-            max_sim_idx = np.argmax(similarities)
+            # Create new cluster
+            cluster_id = self._create_new_cluster(embedding, item_idx)
 
-            if similarities[max_sim_idx] > self.threshold:
-                self.cluster_items[max_sim_idx].append(item_idx)
-                cluster_embeds = [self.item_embeddings[idx] for idx in self.cluster_items[max_sim_idx]]
-                #self.centroids[max_sim_idx] = np.mean(cluster_embeds, axis=0)
-                alpha = 0.05  # Weight for new item (adjust as needed)
-                self.centroids[max_sim_idx] = (1 - alpha) * self.centroids[max_sim_idx] + alpha * embedding
-                assigned_cluster = max_sim_idx
-            else:
-                new_idx = len(self.centroids)
-                self.centroids.append(embedding)
-                self.cluster_items[new_idx].append(item_idx)
-                assigned_cluster = new_idx
-
-        # Periodically adjust threshold after the new item has been assigned a cluster.
+        # Periodic maintenance
         if self.dynamic and (self.counter % self.adjust_interval == 0):
             if self.verbose:
-                print(f"Adjusting threshold at {self.counter} items.")
+                print(f"Performing maintenance at {self.counter} items")
             self._adjust_threshold()
-            
-        if self.verbose:
-            print(f"Items: {len(self.item_embeddings)}. Clusters: {len(self.centroids)}. Threshold: {self.threshold:.2f}.")
+            self._merge_similar_clusters()
 
-        return assigned_cluster
+        if self.verbose:
+            print(f"Added item {item_idx}. Clusters: {len(self.centroids)}. Threshold: {self.threshold:.2f}")
+
+        return cluster_id
+
+    def _create_new_cluster(self, embedding, item_idx):
+        cluster_id = self.next_cluster_id
+        self.next_cluster_id += 1
+        # Normalize embedding
+        normalized_embedding = embedding / np.linalg.norm(embedding)
+        self.cluster_centroids[cluster_id] = normalized_embedding
+        self.cluster_items[cluster_id] = [item_idx]
+        self.item_to_cluster[item_idx] = cluster_id
+        self._update_centroids_list()
+        return cluster_id
+
+    def _update_centroids_list(self):
+        # Update the centroids list to match cluster_centroids order
+        self.centroids = list(self.cluster_centroids.values())
+
+    def _merge_similar_clusters(self):
+        if len(self.centroids) < 2:
+            return
+
+        merge_threshold = 0.85  # Higher threshold for merging
+        similarities = cosine_similarity(self.centroids)
+        np.fill_diagonal(similarities, 0)
+        
+        while True:
+            max_sim = np.max(similarities)
+            if max_sim < merge_threshold:
+                break
+
+            # Find clusters to merge
+            i, j = np.unravel_index(np.argmax(similarities), similarities.shape)
+            cluster_i = list(self.cluster_centroids.keys())[i]
+            cluster_j = list(self.cluster_centroids.keys())[j]
+
+            # Merge clusters
+            items_i = self.cluster_items[cluster_i]
+            items_j = self.cluster_items[cluster_j]
+            all_items = items_i + items_j
+            
+            # Update cluster i with merged items
+            self.cluster_items[cluster_i] = all_items
+            # Update item_to_cluster for all items
+            for item_idx in items_j:
+                self.item_to_cluster[item_idx] = cluster_i
+            
+            # Compute new centroid
+            merged_embeddings = [self.item_embeddings[idx] for idx in all_items]
+            new_centroid = np.mean(merged_embeddings, axis=0)
+            new_centroid = new_centroid / np.linalg.norm(new_centroid)
+            self.cluster_centroids[cluster_i] = new_centroid
+            
+            # Remove cluster j
+            del self.cluster_items[cluster_j]
+            del self.cluster_centroids[cluster_j]
+            
+            # Update centroids list and similarity matrix
+            self._update_centroids_list()
+            similarities = cosine_similarity(self.centroids)
+            np.fill_diagonal(similarities, 0)
 
     def _adjust_threshold(self):
         if len(self.centroids) < 2:
-            print("Cannot adjust threshold with less than 2 clusters.")
-            return  # Silhouette score requires at least 2 clusters
-        
+            return
+
         # Prepare data for silhouette score
-        item_ids = list(self.item_embeddings.keys())
-        embeddings = np.array([self.item_embeddings[idx] for idx in item_ids])
+        embeddings = []
         labels = []
-        for idx in item_ids:
-            for cluster, items in self.cluster_items.items():
-                if idx in items:
-                    labels.append(cluster)
-                    break
         
-        # Calculate silhouette score
+        # Create a mapping of cluster_ids to consecutive integers
+        unique_clusters = sorted(list(self.cluster_centroids.keys()))
+        cluster_map = {cluster_id: idx for idx, cluster_id in enumerate(unique_clusters)}
+        
+        # Collect embeddings and mapped labels
+        for item_idx, cluster_id in self.item_to_cluster.items():
+            embeddings.append(self.item_embeddings[item_idx])
+            labels.append(cluster_map[cluster_id])
+
+        # Convert to numpy arrays
+        embeddings = np.array(embeddings)
+        labels = np.array(labels)
+
         try:
-            score = silhouette_score(embeddings, labels)
-            if score < 0.15:  # Extremely poor clustering
-                self.threshold = max(0.25, self.threshold * 0.95)
-            elif score < 0.25:
-                # Gentle decrease with higher floor
-                self.threshold = max(0.25, self.threshold * 0.98)  
-            elif score > 0.35:
-                # Gentle increase
-                self.threshold = min(0.65, self.threshold * 1.02)
+            score = silhouette_score(embeddings, labels, metric='cosine')
+            
+            if score < 0.1:  # Very poor clustering
+                self.threshold = max(0.3, self.threshold * 0.95)
+            elif score < 0.2:  # Poor clustering
+                self.threshold = max(0.3, self.threshold * 0.98)
+            elif score > 0.4:  # Good clustering
+                self.threshold = min(0.8, self.threshold * 1.02)
+                
             if self.verbose:
-                print(f"Silhouette score: {score:.2f}") 
-                print(f"New threshold: {self.threshold:.2f}")
+                print(f"Silhouette score: {score:.2f}, New threshold: {self.threshold:.2f}")
         except Exception as e:
-            print(f"Error calculating silhouette score: {e}")
-            pass  # Handle cases with single-item clusters
-        
-    def add_item_old(self, embedding, item_idx):
-        self.item_embeddings[item_idx] = embedding
-        self.counter += 1
-        
-        # Periodically adjust threshold
-        if self.dynamic and (self.counter % self.adjust_interval == 0):
-            print(f"Adjusting threshold at {self.counter} items.")
-            self._adjust_threshold()
-
-        # Original clustering logic
-        if not self.centroids:
-            self.centroids.append(embedding)
-            self.cluster_items[0].append(item_idx)
-            return 0
-
-        centroid_matrix = np.array(self.centroids)
-        similarities = cosine_similarity([embedding], centroid_matrix)[0]
-        max_sim_idx = np.argmax(similarities)
-
-        if similarities[max_sim_idx] > self.threshold:
-            self.cluster_items[max_sim_idx].append(item_idx)
-            cluster_embeds = [self.item_embeddings[idx] for idx in self.cluster_items[max_sim_idx]]
-            self.centroids[max_sim_idx] = np.mean(cluster_embeds, axis=0)
-            return max_sim_idx
-        else:
-            new_idx = len(self.centroids)
-            self.centroids.append(embedding)
-            self.cluster_items[new_idx].append(item_idx)
-            return new_idx
+            if self.verbose:
+                print(f"Error calculating silhouette score: {e}")
+            pass
 
 # ----------------------------
 # Recommender System
@@ -324,7 +371,7 @@ class Recommender:
     def __init__(self, clustering_model, movies, embeddings, model):
         self.clustering = clustering_model
         self.movies = movies
-        self.model = model #SentenceTransformer('all-MiniLM-L6-v2')
+        self.model = model
         self.embeddings = embeddings
 
     def recommend_new_user(self, keywords, k=10):
@@ -357,19 +404,18 @@ class Recommender:
                 cluster_history[cluster_id].append(item_id)
         
         sorted_clusters = sorted(cluster_history, key=lambda c: len(cluster_history[c]), reverse=True)
+        print(f"Number of sorted clusters: {len(sorted_clusters)}")
         top_clusters = sorted_clusters[:3]
         recommendations = []
         
         if explore:
-            #all_clusters = list(self.clustering.cluster_items.keys())
-            #non_top_clusters = list(set(all_clusters) - set(top_clusters))
-            non_top_clusters = sorted_clusters[9:14]
+            all_clusters = list(self.clustering.cluster_items.keys())
+            non_top_clusters = list(set(all_clusters) - set(top_clusters))
+            #non_top_clusters = sorted_clusters[9:]
             if non_top_clusters:
                 print(f"Exploring non-top clusters")
                 # Sample from non-top clusters (exploration)
-                #recs = self._sample_from_clusters(non_top_clusters, max(original_k // 2, 1))
-                #recs = self._sample_from_clusters(non_top_clusters, int(round((2/3)*original_k)))
-                recs = self._sample_from_clusters(non_top_clusters, original_k)
+                recs = self._sample_from_clusters(non_top_clusters, int(round((2/3)*original_k)))
                 recommendations += recs
         
         # Determine how many recommendations are still needed
@@ -381,46 +427,22 @@ class Recommender:
         # Ensure exactly original_k items are returned
         return recommendations[:original_k]
 
-    def recommend_existing_user_old(self, history, k=10, explore=False):
-        cluster_history = defaultdict(list)
-        for item_id in history:
-            # Assume item_id is a valid index
-            cluster_id = None
-            # Find which cluster contains the item
-            for cluster, items in self.clustering.cluster_items.items():
-                if item_id in items:
-                    cluster_id = cluster
-                    break
-            if cluster_id is not None:
-                cluster_history[cluster_id].append(item_id)
-        
-        top_clusters = sorted(cluster_history, 
-                            key=lambda c: len(cluster_history[c]), 
-                            reverse=True)[:3]
-        recommendations = []
-        
-        if explore:
-            all_clusters = list(self.clustering.cluster_items.keys())
-            non_top_clusters = list(set(all_clusters) - set(top_clusters))
-            if non_top_clusters:
-                recs = self._sample_from_clusters(non_top_clusters, max(k//2, 1))
-                recommendations += recs
-                k -= len(recs)
-        
-        # Add remaining from top clusters
-        recs_top = self._sample_from_clusters(top_clusters, k)
-        recommendations += recs_top
-        
-        return recommendations[:k]
-
     def _sample_from_clusters(self, clusters, k):
         sampled = []
+        all_available_items = []
+        
+        # Collect all available items from the given clusters
         for cluster in clusters:
             items = self.clustering.cluster_items.get(cluster, [])
-            if not items:
-                continue
-            n = max(1, k // len(clusters))
-            sampled += list(np.random.choice(items, min(n, len(items)), replace=False))
+            if items:
+                all_available_items.extend(items)
+        
+        # If we have items available, sample randomly
+        if all_available_items:
+            # Take min between k and available items to avoid ValueError
+            n_samples = min(k, len(all_available_items))
+            sampled = list(np.random.choice(all_available_items, n_samples, replace=False))
+        
         return sampled
     
     def _sample_random(self, k):
@@ -459,13 +481,12 @@ class Experiments:
         self.n_history_items = n_history_items
         self.n_users = n_users
         self.model = SentenceTransformer('all-MiniLM-L12-v2')
-        self.embeddings = self.model.encode(movies["text"].tolist())#, convert_to_tensor=True).cpu().numpy()
+        self.embeddings = self.model.encode(movies["text"].tolist())
         self.embeddings = normalize(self.embeddings, axis=1) # L2-normalize
         self.verbose = verbose
         self.clustering = OnlineClustering(initial_threshold=0.45, adjust_interval=100, dynamic=True, verbose=self.verbose)
         for idx in range(len(self.movies)):
             self.clustering.add_item(self.embeddings[idx], idx)
-            #print(f"Added item {idx} to clustering. Current clusters: {len(self.clustering.centroids)}. Threshold: {self.clustering.threshold:.2f}. Total items: {len(self.clustering.item_embeddings)}.")
         self.user_histories = self.build_realistic_histories()
         self.validator = LLMValidator(api_key=self.api_key)
         
@@ -483,18 +504,6 @@ class Experiments:
         print(f"User histories: {len(user_histories)}. Num of users: {self.n_users}.")
         return user_histories
         
-    def build_realistic_histories_old(self):
-        user_histories = []
-        for user_id in self.ratings['userId'].unique():
-            user_ratings = self.ratings[self.ratings['userId'] == user_id]
-            print(f"User {user_id} has {len(user_ratings)} ratings.")
-            if len(user_ratings) >= self.n_history_items:
-                history = user_ratings.sample(self.n_history_items, random_state=42)['movieId'].tolist()
-                print(f"User history: {history}")
-                user_histories.append(history)
-        print(f"User histories: {len(user_histories)}. Num of users: {self.n_users}.")
-        return user_histories
-        
     def run_cold_start(self):
         cold_start_recs = []
         recommender = Recommender(self.clustering, self.movies, self.embeddings, self.model)
@@ -503,7 +512,7 @@ class Experiments:
         all_keywords = set()
         for text in self.movies["text"]:
             all_keywords.update(text.lower().split())
-        keywords_list = [np.random.choice(list(all_keywords), 3) for _ in range(self.n_users)]
+        keywords_list = [np.random.choice(list(all_keywords), 5) for _ in range(self.n_users)]
         print(f"Total keywords (corresponds to n_users): {len(keywords_list)}. Example keyword: {keywords_list[0]}")
         
         # Compute ILS for each user and average over all users
@@ -553,8 +562,6 @@ class Experiments:
 
         # Build reverse mapping: internal index -> original movieId
         index_to_id = {idx: row.movieId for idx, row in self.movies.iterrows()}
-        #if self.verbose:
-            #print(f"Index to original movie ID mapping: {index_to_id}")
 
         # Map popular internal indices to their corresponding original movie IDs
         popular_original_ids = [index_to_id.get(movie_index) for movie_index in popular_internal_ids if movie_index in index_to_id]
